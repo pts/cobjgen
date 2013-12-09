@@ -1,0 +1,151 @@
+#! /bin/sh
+eval '(exit $?0)' && eval 'PERL_BADLANG=x;PATH="$PATH:.";export PERL_BADLANG\
+ PATH;exec perl -x -S -- "$0" ${1+"$@"};#'if 0;eval 'setenv PERL_BADLANG x\
+;setenv PATH "$PATH":.;exec perl -x -S -- "$0" $argv:q;#'.q
+#!perl -w
++push@INC,'.';$0=~/(.*)/s;do(index($1,"/")<0?"./$1":$1);die$@if$@__END__+if 0
+;#Don't touch/remove lines 1--7: http://www.inf.bme.hu/~pts/Magic.Perl.Header
+#
+# cobjgen: Generate an .o file with binary data symbol, for C or C++ programs.
+# by pts@fazekas.hu at Sun Dec  8 21:12:46 CET 2013
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+
+use integer;
+use strict;
+
+die "Usage: $0 <input-binary-file>|- <symbol-name> <complier> -c ... <source-file>
+Example: $0 answer.bin answer gcc -c answero.c
+
+Generate an .o file with binary data symbol, for C or C++ programs.
+
+Converts a file with 42 in it to an .o equivalent of
+`const char answer[3] = \"42\n\";', but faster and without generating temporary
+files of excessive size.
+" if @ARGV < 4;
+
+my $input_bin_fn = $ARGV[0];
+my $symbol_name = $ARGV[1];
+die "error: invalid symbol name: $symbol_name\n" if
+    $symbol_name !~ m@\A[_a-zA-Z][:\w]*\Z(?!\n)@;
+my $source_file = $ARGV[-1];
+my $source_base = $source_file;
+die "error: missing extension in source file: $source_file\n" if
+    $source_base !~ s@[.]([^./]+)\Z(?!\n)@@;
+die "error: source file has object extension: $source_file\n" if
+    $1 eq 'obj' or $1 eq 'OBJ' or $1 eq 'o';
+splice @ARGV, 0, 2;
+
+my $input_data;
+my $input_size;
+if ($input_bin_fn eq '-') {
+  my $got = sysseek(STDIN, 0, 2);
+  if (!defined $got) {
+    $input_data = join('', <STDIN>);
+    $input_size = len($input_data);
+  } else {
+    $input_size = $got;
+    $got = sysseek(STDIN, 0, 0);
+    die "error: seek: $!\n" if !defined($got);
+    die "error: unexpected rewind offset: $got\n" if 0 + $got;
+  }
+} else {
+  $input_size = -s $input_bin_fn;
+  die "error: cannot get size of $input_bin_fn: $!\n" if !defined($input_size);
+}
+my $signature = "nTDv8OiFalI";  # Must be ASCII without \ or ".
+my $value_escaped = $signature;
+if ($input_size < 520 or  # File contents not too long.
+    $input_size < length($signature) + 8) {
+  undef $signature;  # Indicate that it's final.
+  if (!defined($input_data)) {
+    $input_data = join('', <STDIN>);
+    my $got_size = length($input_data);
+    die "error: input data size mismatch: got=$got_size expected=$input_size\n" if
+       $got_size != $input_size;
+  }
+  $value_escaped = $input_data;
+  # " and \ are excluded from the regexp. We must also omit ? to avoid
+  # trigraphs. No danger of digraphs, they are not interpreted in string
+  # literals.
+  # TODO(pts): Transform \012 to \n etc.
+  $value_escaped =~ s@([^ !#->\@-\[\]-~])@ sprintf"\\%03o",ord$1 @seg;
+}
+my $msg = "const char $symbol_name\[$input_size] = \"$value_escaped\";
+const char *${symbol_name}_end = $symbol_name + sizeof($symbol_name) / sizeof(char);\n";
+my $sf;
+die "error: open for writing $source_file: $!\n" if
+    !open($sf, '>', $source_file);
+die "error: error writing to $source_file: $1\n" if !print($sf $msg);
+die "error: error closing $source_file: $1\n" if !close($sf);
+unlink "$source_base.o", "$source_base.obj";
+die if @ARGV < 2;  # Ensured by earlier code, needed for system.
+print "@ARGV  # $symbol_name\[$input_size\]\n";  # make(1) also writes to stdout.
+# Works without warnings: gcc -W -Wall -ansi -pedantic -c hio.c
+# gcc is a bit slow for >100 MB files, and needs O(n) memory.
+my $got = system(@ARGV);
+die "error: compiler (@ARGV) failed with status=0x".sprintf("%x", $got)."\n"
+    if $got;
+my $obj_file = "$source_base.o";
+if (!-f $obj_file) {
+  $obj_file = "$source_base.obj";
+  die "error: object file not found for: $source_file\n" if !-f $obj_file;
+}
+my $obj_size = -s $obj_file;
+die "error: error getting object file size: $obj_file\n" if !defined($obj_size);
+my $overhead_size = $obj_size - $input_size - length($symbol_name);
+print "# $overhead_size bytes of overhead in $obj_file\n";
+die "error: overhead too small: $overhead_size\n" if $overhead_size <= 0;
+if (defined $signature) {
+  my $f;
+  die "error: open for reading $obj_file: $!\n" if !open($f, '+<', $obj_file);
+  my $buf;
+  my $read_size = $overhead_size + length($symbol_name);
+  my $got = sysread($f, $buf, $read_size);
+  die "error: error reading header from $obj_file: $!\n" if !defined($got);
+  die "error: short read from $obj_file: $!\n" if $got != $read_size;
+  my $signature0 = "$signature\0\0\0\0\0\0\0\0";
+  my $i = index($buf, $signature0, 0);
+  die "error: signature not found in: $obj_file\n" if $i <= 0;
+  my $j = index($buf, $signature0, $i + 1);
+  die "error: multiple signatures found in: $obj_file\n" if $j > $i;
+  die "error: object file not large enough: $obj_file\n" if
+      $i + $input_size > $obj_size;
+  $got = sysseek($f, $i, 0);
+  die "error: error seeking in object file $obj_file: $!\n" if !defined($got);
+  die "error: invalid seek target in object file $obj_file: $!\n" if
+      $got != $i;
+  my $if;
+  die "error: open for reading $input_bin_fn: $!\n" if
+      !open($if, '+<', $input_bin_fn);
+  my $remaining = $input_size;
+  while ($remaining > 0) {
+    my $now = 1 << 16;
+    $now = $remaining if $now > $remaining;
+    $got = sysread($if, $buf, $now);
+    die "error: error reading from $input_bin_fn: $!\n" if !defined($got);
+    die "error: early EOF in $input_bin_fn\n" if !$got;
+    my $wgot = syswrite($f, $buf, $now);
+    die "error: error writing to object file $obj_file: $!\n" if
+        !defined($wgot);
+    die "error: short write to object file $obj_file: $!\n" if
+        $wgot != $got;
+    $remaining -= $wgot;
+  }
+  die "error: error closing $input_bin_fn: $!\n" if !close($if);
+  die "error: error closing $obj_file: $!\n" if !close($f);
+}
+
+# Remove it, because it may contain the incorrect data. Leaving it around may
+# confuse people later.
+die "error: error removing source file $source_file: $!\n" if
+    !unlink($source_file);
